@@ -25,8 +25,8 @@ from ..parser.context._route_utils import iter_source_files
 from ..parser.context.framework_profiles import detect_framework, profile_to_meta
 from ..parser.imports import extract_imports, _alias_map_cache as _imap_cache, _LANGUAGE_EXTRACTORS as _IMPORT_EXTRACTORS
 from ..security import (
-    validate_path,
     is_symlink_escape,
+    is_junction,
     is_secret_file,
     is_binary_file,
     DEFAULT_MAX_FILE_SIZE,
@@ -473,6 +473,50 @@ def _build_index_filters(
     )
 
 
+def _junction_logical_rel_path(file_path: Path, root: Path) -> Optional[str]:
+    """Logical (unresolved) root-relative path for a junction-mediated file.
+
+    Admission rule for a file whose RESOLVED path escapes the root: its
+    unresolved path must be lexically under the root, at least one
+    directory between root and the file must be a junction, and nothing
+    on that span — including the file itself — may be a symlink (symlink
+    escape policy is unchanged — junctions are always locally created,
+    symlinks can arrive via a hostile clone). Returns the posix rel_path,
+    or None to reject.
+    Windows-only; costs one lstat per ancestor, paid only on the rare
+    resolved-escape branch.
+
+    Takes ``root`` rather than an ``_IndexFilters`` so the single junction
+    admission rule is callable from the per-file path (``index_file``) too,
+    which has a root but no walk config. Prefixes are recomputed per call —
+    cheap, and only the rare escape branch pays for it.
+    """
+    if os.name != "nt":
+        return None
+    root_prefix = str(root) + os.sep
+    lexical = os.path.normpath(str(file_path))
+    if not os.path.normcase(lexical).startswith(os.path.normcase(root_prefix)):
+        return None
+    rel = lexical[len(root_prefix):]
+    saw_junction = False
+    ancestor = root
+    # Every component, the file included: a symlink FILE sitting in a junction
+    # target could otherwise be admitted under a logical in-root path while
+    # pointing anywhere on disk. The full walk rejects that earlier (
+    # _should_index_file step 3), but this rule must stand alone for callers
+    # that have no walk in front of them (index_file). Costs nothing for a
+    # regular file and cannot reject one.
+    for part in rel.split(os.sep):
+        ancestor = ancestor / part
+        if ancestor.is_symlink():
+            return None
+        if is_junction(ancestor):
+            saw_junction = True
+    if not saw_junction:
+        return None
+    return rel.replace("\\", "/")
+
+
 def _should_index_file(
     file_path: Path,
     cfg: _IndexFilters,
@@ -530,22 +574,30 @@ def _should_index_file(
     resolved_str = str(resolved)
     resolved_norm = os.path.normcase(resolved_str)
 
-    # 5. Path traversal — resolved path must be under root
+    # 5. Path traversal — resolved path must be under root. Exception:
+    # a file reached through a junction ancestor inside the root is
+    # admitted under its LOGICAL path (junctions cannot arrive via git
+    # clone; see docs/superpowers/specs/2026-07-12-junction-indexing-design.md).
+    via_junction = False
     if not (
         resolved_norm == cfg.root_str_norm
         or resolved_norm.startswith(cfg.root_prefix_norm)
     ):
-        return False, "path_traversal", "", f"Skipped path traversal: {file_path}"
-
-    # 6. Relative path (posix-style)
-    rel_path = (
-        resolved_str[len(cfg.root_prefix):].replace("\\", "/")
-        if resolved_norm != cfg.root_str_norm
-        else ""
-    )
-    if not rel_path:
-        # The file resolved to the root itself — degenerate case.
-        return False, "unreadable", "", None
+        junction_rel = _junction_logical_rel_path(file_path, cfg.root)
+        if junction_rel is None:
+            return False, "path_traversal", "", f"Skipped path traversal: {file_path}"
+        via_junction = True
+        rel_path = junction_rel
+    else:
+        # 6. Relative path (posix-style)
+        rel_path = (
+            resolved_str[len(cfg.root_prefix):].replace("\\", "/")
+            if resolved_norm != cfg.root_str_norm
+            else ""
+        )
+        if not rel_path:
+            # The file resolved to the root itself — degenerate case.
+            return False, "unreadable", "", None
 
     # 7. Skipped-directory check. The full-walk caller prunes these
     # via ``os.walk``'s ``dirnames`` mutation so files there never
@@ -572,8 +624,14 @@ def _should_index_file(
             if cfg.respect_cachedir_tag and is_cache_directory(ancestor):
                 return False, "cache_dir", rel_path, None
 
-    # 8. Gitignore (string-prefix specs, walk-order)
-    if gitignore_specs and _is_gitignored_fast(resolved_str, gitignore_specs):
+    # 8. Gitignore (string-prefix specs, walk-order). Junction-admitted
+    # files are keyed by their logical path, which lies outside every
+    # gitignore spec's resolved-path prefix — probe with the lexical
+    # path instead so root-tree .gitignore rules still apply to them.
+    gitignore_probe = (
+        os.path.normpath(str(file_path)) if via_junction else resolved_str
+    )
+    if gitignore_specs and _is_gitignored_fast(gitignore_probe, gitignore_specs):
         return False, "gitignore", rel_path, None
 
     # 9. Extra ignore patterns
@@ -1307,8 +1365,22 @@ def discover_local_files(
         failed = os.path.relpath(error.filename or root_str, root_str)
         warnings.append(f"Could not read directory {failed}: {error.strerror or error}")
 
+    visited_real_dirs: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False, onerror=_count_walk_error):
         dpath = Path(dirpath)
+        # Cycle guard: os.walk(followlinks=False) still descends junctions,
+        # so a junction pointing at an ancestor recurses forever. Prune any
+        # directory whose real path we have already walked.
+        try:
+            real_dir = os.path.normcase(os.path.realpath(dirpath))
+        except OSError:
+            logger.debug("realpath failed for %s; treating as its own directory", dirpath, exc_info=True)
+            real_dir = os.path.normcase(dirpath)
+        if real_dir in visited_real_dirs:
+            dirnames[:] = []
+            continue
+        visited_real_dirs.add(real_dir)
+
         # Prune directories that should always be skipped before descending.
         # Nested linked worktrees (`.git` FILE → `.git/worktrees/<name>`,
         # e.g. Claude Code's `<repo>/.claude/worktrees/`) are separate
@@ -2561,9 +2633,16 @@ def index_folder(
             post_discovery_drops[reason] = post_discovery_drops.get(reason, 0) + 1
 
         for file_path in source_files:
-            if not validate_path(folder_path, file_path):
-                _drop("outside_root")
-                continue
+            # No validate_path() re-check here. Containment was already decided
+            # by the discovery feeds — _should_index_file (full walk) and
+            # resolve_explicit_paths, which resolves before testing containment.
+            # validate_path compares RESOLVED paths, so it rejected every file
+            # reached through a junction inside the root that discovery had
+            # deliberately admitted, silently dropping the whole subtree. The
+            # lexical relative_to below is the correct containment test for this
+            # loop: a junction file is lexically under folder_path, an escape
+            # raises ValueError. Same class as #306 — a filter diverging from
+            # the single source of truth.
             try:
                 rel_path = file_path.relative_to(folder_path).as_posix()
             except ValueError:

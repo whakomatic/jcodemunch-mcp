@@ -15,6 +15,7 @@ from ..storage import IndexStore
 from ..storage.index_store import _file_hash, _get_git_head, _get_git_branch
 from ._indexing_pipeline import parse_and_prepare_incremental
 from .resolve_repo import _independent_repo_between
+from .index_folder import _junction_logical_rel_path
 
 logger = logging.getLogger(__name__)
 
@@ -165,8 +166,13 @@ def index_file(
     """
     t0 = time.monotonic()
 
-    # Resolve and validate file path
-    file_path = Path(path).expanduser().resolve()
+    # Resolve and validate file path. Keep the logical (link-preserving) path
+    # alongside the resolved one: a file reached through a junction inside an
+    # indexed root resolves OUTSIDE that root, so resolving eagerly loses the
+    # only path that identifies its repo. os.path.abspath normalizes ".." and
+    # makes absolute without following links.
+    logical_path = Path(os.path.abspath(str(Path(path).expanduser())))
+    file_path = logical_path.resolve()
     if not file_path.exists():
         return {"success": False, "error": f"File not found: {path}"}
     if not file_path.is_file():
@@ -189,7 +195,14 @@ def index_file(
             continue
         try:
             root_path = Path(source_root).resolve()
-            if not file_path.is_relative_to(root_path):
+            # The resolved path is tried first, so behaviour is unchanged for
+            # every ordinary file. The logical fallback lets a junction-mediated
+            # file match the repo it lexically lives in, rather than the repo
+            # (if any) that happens to contain the junction's target.
+            if not (
+                file_path.is_relative_to(root_path)
+                or logical_path.is_relative_to(root_path)
+            ):
                 continue
         except (ValueError, OSError):
             continue
@@ -252,12 +265,18 @@ def index_file(
     # path where it never reached anything).
     _config.load_project_config(str(source_root))
 
-    # Security validation
-    if not validate_path(source_root, file_path):
-        return {"success": False, "error": f"File path failed security validation: {path}"}
-
-    # Compute rel_path, hash, and mtime
-    rel_path = file_path.relative_to(source_root).as_posix()
+    # Security validation + rel_path. validate_path compares RESOLVED paths, so
+    # it rejects a junction-mediated file that index_folder indexes happily.
+    # Fall back to the same junction admission rule the folder walk uses (one
+    # source of truth), which still refuses symlink escapes — junctions are
+    # always locally created, symlinks can arrive via a hostile clone.
+    if validate_path(source_root, file_path):
+        rel_path = file_path.relative_to(source_root).as_posix()
+    else:
+        junction_rel = _junction_logical_rel_path(logical_path, source_root)
+        if junction_rel is None:
+            return {"success": False, "error": f"File path failed security validation: {path}"}
+        rel_path = junction_rel
 
     # Eligibility: match index_folder's discovery filter so a manual index_file
     # call cannot add a credential file that the next full folder index would

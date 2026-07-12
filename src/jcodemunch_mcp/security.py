@@ -1,6 +1,7 @@
 """Security utilities for path validation, secret detection, and binary filtering."""
 
 import os
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -187,6 +188,24 @@ def is_symlink_escape(root: Path, path: Path) -> bool:
     except (OSError, ValueError):
         return True  # If we can't resolve, treat as escape
     return False
+
+
+def is_junction(path: Path) -> bool:
+    """Check if a path is a Windows directory junction (mount-point reparse).
+
+    Junctions are NOT symlinks to Python (``is_symlink()`` is False) and
+    cannot be materialized by ``git clone`` — one in a tree was always
+    created locally. Always False on POSIX and on any stat failure.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    return st.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
 
 
 # --- Secret File Detection ---
