@@ -4,3 +4,4 @@
 # line 1 and fails the gate for a reason no diff explains; measured on the first
 # CI run of the reader. Pin the bytes.
 tests/fixtures/racket/*.rkt text eol=lf
+* text=auto eol=lf

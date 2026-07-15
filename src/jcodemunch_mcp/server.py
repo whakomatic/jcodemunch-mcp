@@ -1404,6 +1404,13 @@ def _coerce_arguments(arguments: dict, schema: dict) -> dict:
                     v = float(v)
                 except (ValueError, TypeError):
                     pass
+            elif expected == "array":
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        v = parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
         result[k] = v
     return result
 

@@ -104,6 +104,11 @@ docs/*
 # able to read it. The rest of docs/ stays local notes.
 !docs/prd-extraction-fingerprint.md
 
+# Environment files (may contain API keys)
+.env
+.env.*
+!.env.example
+
 # macOS
 .DS_Store
 **/.DS_Store
@@ -137,3 +142,5 @@ benchmarks/rust_fidelity/oracle/Cargo.lock
 # LEDGER L-72: a failed bench run's own measurement, written beside the tracked
 # result under --write-results and uploaded by CI; never committed.
 harness/results/*.failed.json
+# Subagent-driven-development scratch
+.superpowers/

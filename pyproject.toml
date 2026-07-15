@@ -130,6 +130,9 @@ exclude = [
     # Git-only: pins tests/fixtures/racket/*.rkt to LF for the frozen byte-position
     # oracle. A checkout concern, not a distribution one.
     ".gitattributes",
+    # This fork's agent notes (whakomatic/jcodemunch-mcp), loaded after
+    # CLAUDE.md. Repository plumbing, never part of the distribution.
+    "CLAUDE.local.md",
     "index.php",
     "vscode-extension/node_modules/",
     "vscode-extension/out/",

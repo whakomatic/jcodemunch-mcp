@@ -410,6 +410,8 @@ def _parse_file_within_budget(content: str, filename: str, language: str, source
         symbols = _parse_ejs_symbols(source_bytes, filename)
     elif language == "verse":
         symbols = _parse_verse_symbols(source_bytes, filename)
+    elif language == "unrealscript":
+        symbols = _parse_unrealscript_symbols(source_bytes, filename)
     elif language == "lua":
         symbols = _parse_lua_symbols(source_bytes, filename)
     elif language == "luau":
@@ -10748,6 +10750,587 @@ def _parse_sql_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
     all_symbols = dbt_symbols + symbols
     all_symbols.sort(key=lambda s: s.line)
     return all_symbols
+
+
+# ---------------------------------------------------------------------------
+# UnrealScript (.uc) — pure-regex extractor. No tree-sitter grammar exists.
+# ---------------------------------------------------------------------------
+
+_UC_FUNC_MODIFIERS = (
+    r"(?:simulated|native(?:\(\s*\d+\s*\))?|static|final|singular|latent|iterator|"
+    r"exec|public|protected|private|protectedwrite|privatewrite|reliable|unreliable|"
+    r"server|client|noexport|noexportheader|virtual|const|k2call|k2pure|k2override)"
+)
+
+_UC_CLASS_HDR_RE = re.compile(r"^[ \t]*class\s+(\w+)\b", re.MULTILINE | re.IGNORECASE)
+_UC_CONST_RE = re.compile(
+    r"^[ \t]*const\s+(\w+)\s*=([^;\n]*);", re.MULTILINE | re.IGNORECASE
+)
+_UC_ENUM_HDR_RE = re.compile(
+    r"^[ \t]*enum\s+(\w+)\s*\{", re.MULTILINE | re.IGNORECASE
+)
+_UC_STRUCT_HDR_RE = re.compile(
+    r"^[ \t]*struct\b([^{;]*?)\{", re.MULTILINE | re.IGNORECASE
+)
+_UC_STATE_HDR_RE = re.compile(
+    r"^[ \t]*(?:(?:simulated|auto)\s+)*state(?:\s*\(\s*\))?\s+(\w+)"
+    r"(?:\s+extends\s+(?:\w+\.)?\w+)?\s*\{",
+    re.MULTILINE | re.IGNORECASE,
+)
+_UC_FUNC_HDR_RE = re.compile(
+    rf"^(?P<indent>[ \t]*)"
+    rf"(?P<prefix>(?:{_UC_FUNC_MODIFIERS}\s+)*(?:function|event|delegate))"
+    rf"(?:\s+(?:coerce\s+)?(?P<rtype>[\w<>\.]+))?"
+    rf"\s+(?P<name>\w+)\s*\(",
+    re.MULTILINE | re.IGNORECASE,
+)
+_UC_OPAQUE_BLOCK_RE = re.compile(
+    r"^[ \t]*(?:defaultproperties|replication|structdefaultproperties|cpptext|cppstruct)\s*\{",
+    re.MULTILINE | re.IGNORECASE,
+)
+_UC_VAR_RE = re.compile(
+    r"^[ \t]*var\s*"
+    r"(?P<cat>\([^)]*\))?"   # optional (Category)
+    r"(?P<body>[^;\n]+)"     # all tokens up to ; or end-of-line
+    r";",
+    re.MULTILINE | re.IGNORECASE,
+)
+_UC_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_UC_MEMBER_CALL_RE = re.compile(
+    r"\b(?:super|outer|self|default)\s*\.\s*([A-Za-z_]\w*)\s*\(",
+    re.IGNORECASE,
+)
+_UC_CALL_BLOCKLIST = frozenset({
+    "if", "else", "while", "for", "foreach", "do", "switch", "case",
+    "return", "new", "delete", "class", "struct", "enum", "var", "local",
+    "const", "function", "event", "delegate", "state", "simulated",
+    "native", "static", "final", "exec", "auto", "super", "outer",
+    "self", "default", "global", "none", "true", "false",
+    "goto", "break", "continue", "stop", "assert",
+})
+
+
+def _uc_match_brace(text: str, start: int) -> Optional[int]:
+    """Return the index of the `}` matching the `{` at `start`."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _uc_match_paren(text: str, start: int) -> Optional[int]:
+    """Return the index of the `)` matching the `(` at `start`."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _uc_mask_noise(text: str) -> str:
+    """Replace comments, strings, name literals, and opaque-block bodies with
+    spaces (preserving newlines) so regex patterns cannot match inside them.
+    """
+    out = list(text)
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        # Line comment: // ... \n
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = i
+            while j < n and text[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        # Block comment: /* ... */
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            out[i] = " "
+            out[i + 1] = " "
+            j = i + 2
+            while j + 1 < n and not (text[j] == "*" and text[j + 1] == "/"):
+                if text[j] != "\n":
+                    out[j] = " "
+                j += 1
+            if j + 1 < n:
+                out[j] = " "
+                out[j + 1] = " "
+                i = j + 2
+            else:
+                i = n
+            continue
+        # Double-quoted string
+        if c == '"':
+            out[i] = " "
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    out[j] = " "
+                    if text[j + 1] != "\n":
+                        out[j + 1] = " "
+                    j += 2
+                    continue
+                if text[j] != "\n":
+                    out[j] = " "
+                j += 1
+            if j < n:
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        # Single-quoted name literal: 'Pkg.Class'
+        if c == "'":
+            out[i] = " "
+            j = i + 1
+            while j < n and text[j] != "'" and text[j] != "\n":
+                out[j] = " "
+                j += 1
+            if j < n and text[j] == "'":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        i += 1
+    masked = "".join(out)
+    # Mask opaque block bodies (defaultproperties / replication / cpptext ...)
+    out = list(masked)
+    for m in _UC_OPAQUE_BLOCK_RE.finditer(masked):
+        brace_pos = m.end() - 1
+        end_brace = _uc_match_brace(masked, brace_pos)
+        if end_brace is None:
+            continue
+        for k in range(brace_pos, end_brace + 1):
+            if out[k] != "\n":
+                out[k] = " "
+    return "".join(out)
+
+
+def _uc_extract_struct_name(mid_text: str) -> Optional[str]:
+    """Given the text between `struct` and `{`, return the struct name.
+
+    Examples:
+        " FooBar "                         -> "FooBar"
+        " native immutable FooBar "        -> "FooBar"
+        " native FooBar extends Baz "      -> "FooBar"
+    """
+    tokens = mid_text.split()
+    lowered = [t.lower() for t in tokens]
+    if "extends" in lowered:
+        idx = lowered.index("extends")
+        if idx == 0:
+            return None
+        name = tokens[idx - 1]
+        return name if name.isidentifier() else None
+    for t in reversed(tokens):
+        if t.isidentifier():
+            return t
+    return None
+
+
+def _uc_count_params(paren_text: str) -> int:
+    """Count top-level comma-separated parameters in a `(...)` slice."""
+    if not paren_text or len(paren_text) < 2:
+        return 0
+    inner = paren_text[1:-1].strip()
+    if not inner:
+        return 0
+    depth = 0
+    count = 1
+    for c in inner:
+        if c in "([<":
+            depth += 1
+        elif c in ")]>":
+            depth -= 1
+        elif c == "," and depth == 0:
+            count += 1
+    return count
+
+
+def _uc_preceding_doc(text: str, pos: int) -> str:
+    """Return a docstring built from the comment lines immediately preceding
+    `pos`. Supports single-line `/** ... */`, `/* ... */`, and contiguous
+    `// ...` blocks. Multi-line block comments are not yet captured.
+    """
+    line_start = text.rfind("\n", 0, pos) + 1
+    if line_start == 0:
+        return ""
+    prev_line_end = line_start - 1
+    prev_line_start = text.rfind("\n", 0, prev_line_end) + 1
+    prev_line = text[prev_line_start:prev_line_end]
+    stripped = prev_line.strip()
+    if stripped.startswith("/*") and stripped.endswith("*/") and len(stripped) >= 4:
+        inner = stripped[2:-2]
+        if inner.startswith("*"):
+            inner = inner[1:]
+        return inner.strip()
+    if stripped.startswith("//"):
+        parts = [stripped[2:].strip()]
+        j_start = prev_line_start
+        while j_start > 0:
+            j_end = j_start - 1
+            j0 = text.rfind("\n", 0, j_end) + 1
+            line = text[j0:j_end]
+            s = line.strip()
+            if s.startswith("//"):
+                parts.insert(0, s[2:].strip())
+                j_start = j0
+            else:
+                break
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def _parse_unrealscript_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Extract symbols from UnrealScript (.uc) source files via regex.
+
+    UnrealScript has no tree-sitter grammar. This extractor recognises:
+
+    - ``class`` declarations (header only; body is the whole file)
+    - ``const`` declarations
+    - ``enum`` declarations
+    - ``struct`` declarations (including modifiers and ``extends``)
+    - ``state`` declarations (including ``auto``/``simulated`` prefixes)
+    - ``function`` / ``event`` / ``delegate`` declarations, including
+      definitions nested inside ``state`` bodies (parent link points at the
+      enclosing state symbol)
+
+    Opaque blocks (``defaultproperties``, ``replication``,
+    ``structdefaultproperties``, ``cpptext``, ``cppstruct``) are masked so
+    their contents cannot produce spurious symbols. See
+    ``docs/future.md`` for deferred capabilities (var, delegate signatures,
+    operator, call graph, import graph).
+    """
+    text = source_bytes.decode("utf-8", errors="replace")
+    if not text:
+        return []
+
+    is_ascii = source_bytes.isascii()
+
+    def byte_of(pos: int) -> int:
+        return pos if is_ascii else len(text[:pos].encode("utf-8"))
+
+    def line_of(pos: int) -> int:
+        return text.count("\n", 0, pos) + 1
+
+    masked = _uc_mask_noise(text)
+
+    symbols: list[Symbol] = []
+    state_ranges: list[tuple[int, int, str]] = []
+    state_name_by_id: dict[str, str] = {}
+
+    # ---- 1) Top-level class declaration ----------------------------------
+    class_sym_id: Optional[str] = None
+    m = _UC_CLASS_HDR_RE.search(masked)
+    if m:
+        name = m.group(1)
+        decl_start = m.start()
+        term = masked.find(";", m.end())
+        header_end = term + 1 if term != -1 else len(masked)
+        end_pos = len(text)
+        signature = " ".join(text[decl_start:header_end].split())
+        docstring = _uc_preceding_doc(text, decl_start)
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        sym = Symbol(
+            id=make_symbol_id(filename, name, "class"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="class",
+            language="unrealscript",
+            signature=signature,
+            docstring=docstring,
+            parent=None,
+            line=line_of(decl_start),
+            end_line=max(line_of(end_pos - 1), line_of(decl_start)),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        )
+        symbols.append(sym)
+        class_sym_id = sym.id
+
+    def parent_at(pos: int) -> Optional[str]:
+        for sstart, send, sid in state_ranges:
+            if sstart <= pos < send:
+                return sid
+        return class_sym_id
+
+    # ---- 2) States (before functions, so nested functions know their parent)
+    for m in _UC_STATE_HDR_RE.finditer(masked):
+        name = m.group(1)
+        decl_start = m.start()
+        brace_pos = masked.rfind("{", m.start(), m.end())
+        if brace_pos == -1:
+            continue
+        end_brace = _uc_match_brace(masked, brace_pos)
+        if end_brace is None:
+            continue
+        end_pos = end_brace + 1
+        header = text[decl_start:brace_pos].rstrip()
+        signature = " ".join(header.split())
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        sym = Symbol(
+            id=make_symbol_id(filename, name, "class"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="class",
+            language="unrealscript",
+            signature=signature,
+            parent=class_sym_id,
+            line=line_of(decl_start),
+            end_line=line_of(end_pos),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        )
+        symbols.append(sym)
+        state_ranges.append((brace_pos, end_pos, sym.id))
+        state_name_by_id[sym.id] = name
+
+    # ---- 3) Const -----------------------------------------------------------
+    for m in _UC_CONST_RE.finditer(masked):
+        name = m.group(1)
+        value = m.group(2).strip()
+        decl_start = m.start()
+        end_pos = m.end()
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "constant"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="constant",
+            language="unrealscript",
+            signature=f"const {name} = {value}",
+            parent=parent_at(decl_start),
+            line=line_of(decl_start),
+            end_line=line_of(decl_start),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        ))
+
+    # ---- 4) Enum ------------------------------------------------------------
+    for m in _UC_ENUM_HDR_RE.finditer(masked):
+        name = m.group(1)
+        decl_start = m.start()
+        brace_pos = m.end() - 1
+        end_brace = _uc_match_brace(masked, brace_pos)
+        if end_brace is None:
+            continue
+        end_pos = end_brace + 1
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "type"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="type",
+            language="unrealscript",
+            signature=f"enum {name}",
+            parent=parent_at(decl_start),
+            line=line_of(decl_start),
+            end_line=line_of(end_pos),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        ))
+
+    # ---- 5) Struct ----------------------------------------------------------
+    struct_body_ranges: list[tuple[int, int]] = []
+    for m in _UC_STRUCT_HDR_RE.finditer(masked):
+        mid = m.group(1)
+        name = _uc_extract_struct_name(mid)
+        if not name:
+            continue
+        decl_start = m.start()
+        brace_pos = m.end() - 1
+        end_brace = _uc_match_brace(masked, brace_pos)
+        if end_brace is None:
+            continue
+        end_pos = end_brace + 1
+        struct_body_ranges.append((brace_pos, end_pos))
+        header = text[decl_start:brace_pos].rstrip()
+        signature = " ".join(header.split())
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "type"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="type",
+            language="unrealscript",
+            signature=signature,
+            parent=parent_at(decl_start),
+            line=line_of(decl_start),
+            end_line=line_of(end_pos),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        ))
+
+    def inside_struct(pos: int) -> bool:
+        return any(s <= pos < e for s, e in struct_body_ranges)
+
+    # ---- 6) Var declarations (class-scope and state-body; not struct-body) --
+    for m in _UC_VAR_RE.finditer(masked):
+        if inside_struct(m.start()):
+            continue
+        cat = (m.group("cat") or "").strip()  # e.g. "(Weapon)"
+        body = (m.group("body") or "").strip()
+        # Split on commas: first part has mods+type+name, rest have only name
+        comma_parts = [p.strip() for p in body.split(",")]
+        if not comma_parts:
+            continue
+        # First comma-part: [...mods] type firstname[subscript]?
+        first_tokens = comma_parts[0].split()
+        if len(first_tokens) < 2:
+            continue  # need at least type + name
+        # Last token is the first variable name (possibly with [N])
+        first_name = re.sub(r"\s*\[[^\]]*\]$", "", first_tokens[-1]).strip()
+        type_tok = first_tokens[-2]  # token right before name = type
+        mods = " ".join(first_tokens[:-2])
+        decl_start = m.start()
+        decl_end = m.end()
+        src_bytes = text[decl_start:decl_end].encode("utf-8")
+
+        def _make_var_sig(vname: str) -> str:
+            parts = [f"var{cat}" if cat else "var"]
+            if mods:
+                parts.extend(mods.split())
+            parts.append(type_tok)
+            parts.append(vname)
+            return " ".join(parts)
+
+        all_varnames = [first_name]
+        for cp in comma_parts[1:]:
+            vn = re.sub(r"\s*\[[^\]]*\]", "", cp).strip()
+            if vn:
+                all_varnames.append(vn)
+
+        for varname in all_varnames:
+            if not varname or not re.match(r"^\w+$", varname):
+                continue
+            symbols.append(Symbol(
+                id=make_symbol_id(filename, varname, "constant"),
+                file=filename,
+                name=varname,
+                qualified_name=varname,
+                kind="constant",
+                language="unrealscript",
+                signature=_make_var_sig(varname),
+                parent=class_sym_id,
+                line=line_of(decl_start),
+                end_line=line_of(decl_start),
+                byte_offset=byte_of(decl_start),
+                byte_length=byte_of(decl_end) - byte_of(decl_start),
+                content_hash=compute_content_hash(src_bytes),
+            ))
+
+    # ---- 7) Functions / events / delegates ----------------------------------
+    func_syms: list[Symbol] = []
+    for m in _UC_FUNC_HDR_RE.finditer(masked):
+        name = m.group("name")
+        decl_start = m.start()
+        paren_pos = m.end() - 1
+        close_paren = _uc_match_paren(masked, paren_pos)
+        if close_paren is None:
+            continue
+        tail = close_paren + 1
+        sep_idx: Optional[int] = None
+        k = tail
+        while k < len(masked):
+            ch = masked[k]
+            if ch == ";" or ch == "{":
+                sep_idx = k
+                break
+            k += 1
+        if sep_idx is None:
+            continue
+        if masked[sep_idx] == ";":
+            end_pos = sep_idx + 1
+        else:
+            end_brace = _uc_match_brace(masked, sep_idx)
+            if end_brace is None:
+                continue
+            end_pos = end_brace + 1
+        sig_end = close_paren + 1
+        signature = " ".join(text[decl_start:sig_end].split())
+        docstring = _uc_preceding_doc(text, decl_start)
+        parent_id = parent_at(decl_start)
+        qname = name
+        if parent_id and parent_id != class_sym_id and parent_id in state_name_by_id:
+            qname = f"{state_name_by_id[parent_id]}.{name}"
+        src_bytes = text[decl_start:end_pos].encode("utf-8")
+        sym = Symbol(
+            id=make_symbol_id(filename, qname, "function"),
+            file=filename,
+            name=name,
+            qualified_name=qname,
+            kind="function",
+            language="unrealscript",
+            signature=signature,
+            docstring=docstring,
+            parent=parent_id,
+            line=line_of(decl_start),
+            end_line=line_of(end_pos),
+            byte_offset=byte_of(decl_start),
+            byte_length=byte_of(end_pos) - byte_of(decl_start),
+            content_hash=compute_content_hash(src_bytes),
+        )
+        sym.param_count = _uc_count_params(text[paren_pos:close_paren + 1])
+        symbols.append(sym)
+        func_syms.append(sym)
+
+    # ---- 8) Call graph pass (runs after all symbols are collected) ----------
+    for sym in func_syms:
+        if is_ascii:
+            full_slice = masked[sym.byte_offset : sym.byte_offset + sym.byte_length]
+        else:
+            char_start = len(source_bytes[: sym.byte_offset].decode("utf-8", errors="replace"))
+            char_len = len(
+                source_bytes[sym.byte_offset : sym.byte_offset + sym.byte_length].decode(
+                    "utf-8", errors="replace"
+                )
+            )
+            full_slice = masked[char_start : char_start + char_len]
+        # Only scan inside the braces; skip signature (avoids matching the function name itself)
+        brace_idx = full_slice.find("{")
+        if brace_idx == -1:
+            continue  # no body (native/abstract declaration ending with ;)
+        body_slice = full_slice[brace_idx:]
+        called: set[str] = set()
+        for cm in _UC_CALL_RE.finditer(body_slice):
+            name = cm.group(1)
+            if name not in _UC_CALL_BLOCKLIST:
+                called.add(name)
+        for cm in _UC_MEMBER_CALL_RE.finditer(body_slice):
+            name = cm.group(1)
+            if name not in _UC_CALL_BLOCKLIST:
+                called.add(name)
+        sym.call_references = sorted(called)
+
+    symbols.sort(key=lambda s: (s.line, s.byte_offset))
+    return symbols
 
 
 def _parse_objc_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:

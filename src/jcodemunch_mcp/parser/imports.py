@@ -139,6 +139,18 @@ _GLEAM_IMPORT = re.compile(
     re.MULTILINE,
 )
 
+# UnrealScript: class Foo extends Bar [within Baz] [dependson(X,Y)];
+# Captures: extends clause, within clause, dependson list, class'Pkg.Name' literals.
+_UC_CLASS_DEP_RE = re.compile(
+    r"""^[ \t]*class\s+\w+\b([^;]*)""",
+    re.MULTILINE | re.IGNORECASE,
+)
+_UC_EXTENDS_RE = re.compile(r"""\bextends\s+(\w+)""", re.IGNORECASE)
+_UC_WITHIN_RE = re.compile(r"""\bwithin\s+(\w+)""", re.IGNORECASE)
+_UC_DEPENDSON_RE = re.compile(r"""\bdependson\s*\(\s*([^)]+)\)""", re.IGNORECASE)
+# class'Pkg.Name' or class'Name' — the name after the last dot is the class file.
+_UC_CLASS_LITERAL_RE = re.compile(r"""\bclass\s*'\s*(?:\w+\.)?\s*(\w+)\s*'""", re.IGNORECASE)
+
 
 def _clean_names(raw: str) -> list[str]:
     """Parse comma-separated names from an import clause, stripping aliases/whitespace."""
@@ -1404,6 +1416,48 @@ def augment_racket_collection_edges(imports: dict, source_root: str, source_file
     return added
 
 
+def _extract_unrealscript_imports(content: str) -> list[dict]:
+    """Extract file-level dependencies from an UnrealScript (.uc) source file.
+
+    UnrealScript has no import keyword. Dependencies come from:
+    - ``class Foo extends Bar``  -- Bar.uc in the same package tree
+    - ``class Foo within Baz``   -- Baz.uc (outer object constraint)
+    - ``dependson(A, B)``        -- A.uc, B.uc (compile-order dependency)
+    - ``class'Pkg.Name'``        -- Name.uc (cross-package class reference)
+    """
+    seen: set[str] = set()
+    edges: list[dict] = []
+
+    def add(name: str) -> None:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            edges.append({"specifier": name, "names": [name]})
+
+    # Parse the class header line for extends / within / dependson.
+    m = _UC_CLASS_DEP_RE.search(content)
+    if m:
+        header = m.group(1)
+        em = _UC_EXTENDS_RE.search(header)
+        if em:
+            add(em.group(1))
+        wm = _UC_WITHIN_RE.search(header)
+        if wm:
+            add(wm.group(1))
+        dm = _UC_DEPENDSON_RE.search(header)
+        if dm:
+            for part in dm.group(1).split(","):
+                name = part.strip()
+                if name:
+                    add(name)
+
+    # Scan the whole file for class'Pkg.Name' references.
+    for lm in _UC_CLASS_LITERAL_RE.finditer(content):
+        add(lm.group(1))
+
+    return edges
+
+
 _LANGUAGE_EXTRACTORS = {
     "javascript": _extract_js_imports,
     "typescript": _extract_js_imports,
@@ -1434,6 +1488,7 @@ _LANGUAGE_EXTRACTORS = {
     "asm": _extract_asm_imports,
     "vhdl": _extract_vhdl_imports,
     "verilog": _extract_verilog_imports,
+    "unrealscript": _extract_unrealscript_imports,
 }
 
 
@@ -1602,6 +1657,32 @@ def _get_sql_stems(source_files: set[str]) -> dict[str, str]:
         if len(_sql_stem_cache) >= _SQL_STEM_CACHE_MAX:
             _sql_stem_cache.pop(next(iter(_sql_stem_cache)))
         _sql_stem_cache[key] = stems
+    return stems
+
+
+_uc_stem_cache: dict[frozenset, dict[str, str]] = {}
+_UC_STEM_CACHE_MAX = 4
+_UC_STEM_LOCK = threading.Lock()
+
+
+def _get_uc_stems(source_files: set[str]) -> dict[str, str]:
+    """Return a lowered-stem -> file_path dict for .uc files, cached by content."""
+    key = frozenset(f for f in source_files if f.endswith(".uc"))
+    with _UC_STEM_LOCK:
+        cached = _uc_stem_cache.get(key)
+        if cached is not None:
+            return cached
+
+    stems: dict[str, str] = {}
+    for sf in key:
+        stem = posixpath.splitext(posixpath.basename(sf))[0].lower()
+        if stem not in stems:  # first match wins
+            stems[stem] = sf
+
+    with _UC_STEM_LOCK:
+        if len(_uc_stem_cache) >= _UC_STEM_CACHE_MAX:
+            _uc_stem_cache.pop(next(iter(_uc_stem_cache)))
+        _uc_stem_cache[key] = stems
     return stems
 
 
@@ -2326,10 +2407,13 @@ def resolve_specifier(
                 if c in source_files:
                     return c
 
-    # Stem matching fallback: bare names like dbt ref('dim_client')
-    # resolve to any .sql file whose stem matches.  Uses a cached stem
-    # dict to avoid O(n) scans on repeated calls with the same source_files.
+    # Stem matching fallback: bare names like dbt ref('dim_client') resolve to
+    # any .sql file whose stem matches; bare UnrealScript class names ('Actor',
+    # 'Pawn') resolve to any .uc file whose stem matches.
     if "/" not in specifier and "." not in specifier and "\\" not in specifier:
-        return _get_sql_stems(source_files).get(specifier.lower())
+        sql_match = _get_sql_stems(source_files).get(specifier.lower())
+        if sql_match:
+            return sql_match
+        return _get_uc_stems(source_files).get(specifier.lower())
 
     return None

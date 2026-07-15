@@ -98,6 +98,8 @@ _IMPORT_PATTERNS = {
     "nix": re.compile(r"^\s*(?:import|with)\s+"),
     "ejs": re.compile(r"<%[=-]?\s*(?:require|import)\s*"),
     "verse": re.compile(r"^\s*(?:using|import)\s+"),
+    # UnrealScript: class Foo extends Bar / within Baz / dependson(X)
+    "unrealscript": re.compile(r"^\s*class\s+\w+.*\b(?:extends|within|dependson)\b", re.IGNORECASE),
 }
 
 # Definition patterns per language
@@ -125,6 +127,11 @@ _DEF_PATTERNS = {
     "scala": re.compile(r"^\s*(private\s+|protected\s+)?(abstract\s+|sealed\s+|case\s+)?(class|object|trait|def|val|var|type|enum)\s+{name}\b"),
     "haskell": re.compile(r"^\s*(data|type|newtype|class)\s+{name}\b"),
     "dart": re.compile(r"^\s*(abstract\s+)?(class|mixin|enum|extension|typedef)\s+{name}\b"),
+    # UnrealScript declarations carry leading modifiers (simulated, static,
+    # native, final, ...) and often a type between the keyword and the name
+    # (`function bool Foo()`, `var config int Foo;`). The inline (?i) is load
+    # bearing: callers recompile from ``.pattern``, which drops compile flags.
+    "unrealscript": re.compile(r"(?i)^\s*(?:\w+\s+)*?(class|struct|enum|state|function|event|delegate|const|var)\s+(?:[\w<>,\s]+?\s+)?{name}\b"),
     # -- Tier 2: languages with tree-sitter but no import extractors --
     "elixir": re.compile(r"^\s*(defmodule|def|defp|defmacro|defmacrop|defstruct|defguard|defdelegate)\s+{name}\b"),
     "perl": re.compile(r"^\s*(sub|package)\s+{name}\b"),

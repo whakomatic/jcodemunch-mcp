@@ -1,7 +1,6 @@
 """Tests for repository-wide retrieval tools."""
 
 import json
-import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -337,7 +336,12 @@ def test_get_file_outline_batch_empty_list(tmp_path):
 
 
 def test_get_file_outline_both_params_raises(tmp_path):
-    """Passing both file_path and file_paths raises ValueError."""
+    """Passing both file_path and file_paths is rejected.
+
+    This fork returns the rejection as an ``error`` payload rather than
+    raising (commit acca6d4), so the caller gets a normal MCP result instead
+    of a traceback. Upstream asserts ``pytest.raises(ValueError)`` here.
+    """
     src = tmp_path / "src"
     src.mkdir()
     (src / "a.py").write_text("def foo(): pass")
@@ -345,13 +349,13 @@ def test_get_file_outline_both_params_raises(tmp_path):
     repo = idx["repo"]
 
     from jcodemunch_mcp.tools.get_file_outline import get_file_outline
-    with pytest.raises(ValueError):
-        get_file_outline(
-            repo=repo,
-            file_path="src/a.py",
-            file_paths=["src/a.py"],
-            storage_path=str(tmp_path / "idx"),
-        )
+    result = get_file_outline(
+        repo=repo,
+        file_path="src/a.py",
+        file_paths=["src/a.py"],
+        storage_path=str(tmp_path / "idx"),
+    )
+    assert "not both and not neither" in result["error"]
 
 
 def test_get_file_outline_decorated_function_has_decorators(tmp_path):

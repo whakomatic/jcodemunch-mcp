@@ -153,6 +153,8 @@ LANGUAGE_EXTENSIONS = {
     ".for": "fortran",
     ".fpp": "fortran",
     ".sql": "sql",
+    # UnrealScript (UDK / UE3 / legacy Unreal Engine)
+    ".uc": "unrealscript",
     # Scala
     ".scala": "scala",
     ".sc": "scala",
@@ -1281,6 +1283,32 @@ VERSE_SPEC = LanguageSpec(
 )
 
 
+# UnrealScript (UDK / UE3) specification
+# NOTE: No tree-sitter grammar exists for UnrealScript. Symbol extraction is
+# performed by _parse_unrealscript_symbols() in extractor.py using regex-based
+# parsing (same approach as Verse and Blade).
+#
+# Covered constructs: class, function, event, state, const, struct, enum, and
+# nested functions inside state bodies. defaultproperties / replication blocks
+# are treated as opaque (their contents do not produce symbols).
+#
+# Deferred (documented in docs/future.md): var, delegate, operator, native
+# replication table, call-graph / import-graph participation, defaultproperties
+# deep parsing.
+#
+# The LanguageSpec fields below are intentionally empty — all extraction logic
+# lives in _parse_unrealscript_symbols().
+UNREALSCRIPT_SPEC = LanguageSpec(
+    ts_language="unrealscript",
+    symbol_node_types={},
+    name_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=[],
+)
+
+
 # Fortran specification
 # NOTE: Fortran's tree-sitter grammar uses a translation_unit root with
 # function/subroutine/module/program top-level nodes.  function_statement
@@ -2063,6 +2091,7 @@ LANGUAGE_REGISTRY = {
     "svelte": SVELTE_SPEC,
     "ejs": EJS_SPEC,
     "verse": VERSE_SPEC,
+    "unrealscript": UNREALSCRIPT_SPEC,
     "lua": LUA_SPEC,
     "luau": LUAU_SPEC,
     "erlang": ERLANG_SPEC,
