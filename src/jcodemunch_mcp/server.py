@@ -9475,6 +9475,16 @@ def main(argv: Optional[list[str]] = None):
         help="Emit the structured {success, repo, message|error} JSON result",
     )
 
+    reap_parser = subparsers.add_parser(
+        "reap-indexes",
+        help="Remove indexes whose source tree is provably gone (dry run unless --apply)",
+    )
+    reap_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete. Without it the pass only reports what it would remove.",
+    )
+
     # --model choices derive from the single receipt price table so the two
     # CLI subparsers can never drift from the rates (see cli/receipt.py).
     from .cli.receipt import _MODEL_PRICES_USD_PER_MTOK as _RECEIPT_MODEL_PRICES
@@ -10319,7 +10329,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "hook-sessionstart", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "refresh", "health", "file-risk", "observatory", "keyring", "surface"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "hook-sessionstart", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "reap-indexes", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "refresh", "health", "file-risk", "observatory", "keyring", "surface"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -10535,6 +10545,18 @@ def main(argv: Optional[list[str]] = None):
                 for line in render_offer_lines(stats["surface_offer"]):
                     print(line)
         return
+
+    if args.command == "reap-indexes":
+        # Dry run unless --apply, because the predicate is the whole risk and the
+        # operator has to be able to read its answer before trusting it.
+        from .tools.reap_indexes import reap_indexes
+        import json as _json
+        result = reap_indexes(apply=args.apply)
+        print(_json.dumps(result, indent=2))
+        if not args.apply:
+            print()
+            print(str(result["reaped_count"]) + " index(es) would be removed; re-run with --apply")
+        return 0
 
     if args.command == "delete-index":
         # CLI alias for the invalidate_cache MCP tool: resolves the repo,
