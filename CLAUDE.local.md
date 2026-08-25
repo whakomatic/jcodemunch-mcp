@@ -40,7 +40,11 @@
 - Editable install: src/ is live, no reinstall needed after an edit. But the
   RUNNING MCP server still holds the old code, so restart it before trusting
   index_folder via MCP. (Verified: a fresh process indexes a junction tree at
-  2 files while the running server returns 1.)
+  2 files while the running server returns 1.) Adding a NAME to a module the
+  server already imported is worse than stale behaviour: a lazily-imported
+  caller is read fresh off disk and fails `ImportError: cannot import name ...
+  from` against the cached module, so the tool errors outright until the server
+  restarts.
 - The uv tool `jcodemunch-cli` SHARES this source: ../jcodemunch-cli declares
   jcodemunch-mcp = { path = "../jcodemunch-mcp", editable = true } under
   [tool.uv.sources], and uv tool install honors it (its venv has an
