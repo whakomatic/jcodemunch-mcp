@@ -12,6 +12,7 @@ from ..parser import LANGUAGE_EXTENSIONS, get_language_for_path
 from ..parser.context import discover_providers, collect_metadata
 from ..security import validate_path, is_secret_file
 from ..storage import IndexStore
+from ..storage.git_root import linked_worktree_between
 from ..storage.index_store import _file_hash, _get_git_head, _get_git_branch
 from ._indexing_pipeline import parse_and_prepare_incremental
 from .resolve_repo import _independent_repo_between
@@ -188,6 +189,9 @@ def index_file(
     # Candidates rejected for belonging to a different repository, kept so the
     # refusal can say WHICH repository rather than "no index contains this".
     _blocked_by_boundary: list[tuple[str, Path]] = []
+    # Same, for candidates rejected for owning the file only across a linked
+    # worktree boundary.
+    _blocked_by_worktree: list[tuple[str, Path]] = []
 
     for repo_entry in repos:
         source_root = repo_entry.get("source_root", "")
@@ -217,6 +221,21 @@ def index_file(
         if _boundary is not None:
             _blocked_by_boundary.append((repo_entry.get("repo", ""), _boundary))
             continue
+        # A linked worktree is NOT an independent repository, so the check above
+        # passes it through by design (`resolve_repo._independent_repo_between`
+        # says so in as many words). Containment therefore has to be asked a
+        # second question here, and the walk's answer to it — #372's pruning —
+        # never reached this entry point: `<repo>/.worktrees/<pkg>/f.py` really
+        # is inside `<repo>`, so the hook wrote a throwaway tree's copy of a
+        # file into the base index beside the live one, where it outranked it.
+        _worktree = linked_worktree_between(root_path, file_path) or (
+            linked_worktree_between(root_path, logical_path)
+            if logical_path != file_path
+            else None
+        )
+        if _worktree is not None:
+            _blocked_by_worktree.append((repo_entry.get("repo", ""), _worktree))
+            continue
         if len(str(root_path)) > best_root_len:
             best_match = repo_entry
             best_root_len = len(str(root_path))
@@ -242,6 +261,23 @@ def index_file(
                     f"index_folder on {_repo_root} first."
                 ),
                 "skipped": "different_repository",
+            }
+        if _blocked_by_worktree:
+            _enclosing, _wt_root = _blocked_by_worktree[0]
+            return {
+                "success": False,
+                "error": (
+                    f"{path} is inside the linked git worktree at {_wt_root}, "
+                    f"which has no index of its own. It is inside the indexed "
+                    f"folder for '{_enclosing}', but a worktree is a separate "
+                    f"working tree on a separate branch — writing this file "
+                    f"there would put a throwaway tree's copy beside the base "
+                    f"checkout's, where it outranks the live one. To index this "
+                    f"worktree as its own repo, run "
+                    f"index_folder(path='{_wt_root}'); otherwise let the change "
+                    f"enter '{_enclosing}' when it merges."
+                ),
+                "skipped": "linked_worktree",
             }
         return {
             "success": False,

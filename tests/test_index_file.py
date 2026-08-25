@@ -187,3 +187,106 @@ class TestIndexFile:
         )
         assert result["success"] is False
         assert "not a file" in result["error"]
+
+
+class TestLinkedWorktreeRefusal:
+    """The per-file entry point must not admit a linked worktree's files into
+    the parent's index.
+
+    jcodemunch already had containment with deepest-match, walk-side worktree
+    pruning and `is_linked_worktree` — and still polluted, because containment
+    is true for `<repo>/.worktrees/<pkg>/f.py` and nothing asked the second
+    question after it matched. Measured 2026-08-24: 46 symbols from two
+    develop3 worktrees sitting in a base index, where a dead worktree's stale
+    copy outranked the live tree and read a closed defect as open.
+    """
+
+    def _fake_worktree(self, parent_root: Path, rel: str) -> Path:
+        """A directory shaped like a linked worktree (no real git needed)."""
+        wt = parent_root / rel
+        wt.mkdir(parents=True)
+        (wt / ".git").write_text(
+            f"gitdir: {parent_root / '.git' / 'worktrees' / wt.name}\n",
+            encoding="utf-8",
+        )
+        return wt
+
+    def test_worktree_file_is_refused(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        store_path = tmp_path / "store"
+        _write_py(src, "calc.py", "def add(a, b):\n    return a + b\n")
+        indexed = index_folder(
+            str(src), use_ai_summaries=False, storage_path=str(store_path)
+        )
+        assert indexed["success"] is True
+        before = indexed["symbol_count"]
+
+        wt = self._fake_worktree(src, ".worktrees/d3-pkg")
+        wt_file = _write_py(wt, "calc.py", "def add(a, b):\n    return a + b\n")
+
+        result = index_file(
+            path=str(wt_file),
+            use_ai_summaries=False,
+            storage_path=str(store_path),
+        )
+        assert result["success"] is False
+        assert result["skipped"] == "linked_worktree"
+        assert str(wt) in result["error"]
+
+        store = IndexStore(base_path=str(store_path))
+        repo_name = store.list_repos()[0]["repo"].split("/")[1]
+        index = store.load_index("local", repo_name)
+        assert index is not None
+        assert len(index.symbols) == before
+        assert not any(".worktrees" in p for p in index.source_files)
+
+    def test_base_checkout_file_still_indexes(self, tmp_path):
+        """The guard is not a blanket refusal."""
+        src = tmp_path / "src"
+        src.mkdir()
+        store_path = tmp_path / "store"
+        py_file = _write_py(src, "calc.py", "def add(a, b):\n    return a + b\n")
+        self._fake_worktree(src, ".worktrees/d3-pkg")
+        assert index_folder(
+            str(src), use_ai_summaries=False, storage_path=str(store_path)
+        )["success"] is True
+
+        _write_py(
+            src, "calc.py",
+            "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n",
+        )
+        result = index_file(
+            path=str(py_file),
+            use_ai_summaries=False,
+            storage_path=str(store_path),
+        )
+        assert result["success"] is True
+        assert result["symbol_count"] == 2
+
+    def test_index_rooted_at_the_worktree_owns_its_own_files(self, tmp_path):
+        """A worktree's content belongs to the worktree's index, or to none."""
+        src = tmp_path / "src"
+        src.mkdir()
+        store_path = tmp_path / "store"
+        _write_py(src, "calc.py", "def add(a, b):\n    return a + b\n")
+        assert index_folder(
+            str(src), use_ai_summaries=False, storage_path=str(store_path)
+        )["success"] is True
+        base_repo = IndexStore(base_path=str(store_path)).list_repos()[0]["repo"]
+
+        wt = self._fake_worktree(src, ".worktrees/d3-pkg")
+        wt_file = _write_py(wt, "calc.py", "def add(a, b):\n    return a + b\n")
+        assert index_folder(
+            str(wt), use_ai_summaries=False, storage_path=str(store_path)
+        )["success"] is True
+
+        result = index_file(
+            path=str(wt_file),
+            use_ai_summaries=False,
+            storage_path=str(store_path),
+        )
+        assert result["success"] is True
+        assert result["file"] == "calc.py"
+        # Owned by the worktree's own index, not the parent's.
+        assert result["repo"] != base_repo

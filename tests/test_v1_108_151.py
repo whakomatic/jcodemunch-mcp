@@ -14,6 +14,7 @@ from jcodemunch_mcp.storage.git_root import (
     _existing_git_identity,
     detect_git_root,
     is_linked_worktree,
+    linked_worktree_between,
 )
 from jcodemunch_mcp.tools.index_folder import (
     _build_index_filters,
@@ -156,3 +157,36 @@ class TestWorktreeIdentity:
         # A path inside the nested worktree must NOT match the parent slot.
         assert _existing_git_identity(wt.resolve(), store) is None
         assert _existing_git_identity((wt / "inner").resolve(), store) is None
+
+
+class TestLinkedWorktreeBetween:
+    """The containment resolver's second question (see `index_file`).
+
+    Containment alone answers "is the file under this root"; a worktree makes
+    that true while the answer to "does this root own it" is still no.
+    """
+
+    def test_worktree_between_root_and_file(self, tmp_path):
+        wt = _fake_worktree(tmp_path, ".worktrees/d3-pkg")
+        assert linked_worktree_between(tmp_path, wt / "src" / "a.py") == wt
+
+    def test_plain_file_under_root(self, tmp_path):
+        assert linked_worktree_between(tmp_path, tmp_path / "src" / "a.py") is None
+
+    def test_root_is_the_worktree(self, tmp_path):
+        """An index rooted AT the worktree owns its own files."""
+        wt = _fake_worktree(tmp_path, "wt")
+        assert linked_worktree_between(wt, wt / "src" / "a.py") is None
+
+    def test_submodule_is_not_a_worktree(self, tmp_path):
+        """#372's boundary: submodule content IS indexed into the parent."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".git").write_text(
+            "gitdir: ../.git/modules/sub\n", encoding="utf-8"
+        )
+        assert linked_worktree_between(tmp_path, sub / "a.py") is None
+
+    def test_path_outside_root(self, tmp_path):
+        outside = tmp_path.parent / "elsewhere" / "a.py"
+        assert linked_worktree_between(tmp_path / "root", outside) is None

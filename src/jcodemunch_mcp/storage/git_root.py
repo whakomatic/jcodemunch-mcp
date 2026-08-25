@@ -257,6 +257,38 @@ def is_linked_worktree(path: Path) -> bool:
     return target.parent.name == "worktrees"
 
 
+def linked_worktree_between(source_root: Path, path: Path) -> Optional[Path]:
+    """Root of a linked worktree between an indexed root and a path, or None.
+
+    ⚠⚠ Containment does NOT imply the worktree rule. `<repo>/.worktrees/<x>/f.py`
+    is genuinely inside `<repo>`, and `_independent_repo_between` deliberately
+    lets it through (a worktree shares the parent's history, so it is not an
+    independent repository). Callers that resolve ownership by containment
+    therefore need this second question, or they write a worktree's copy of a
+    file into the parent's index next to the live one.
+
+    `source_root` itself is never tested, so an index rooted AT the worktree
+    owns its own files: the rule is that a worktree's content belongs to the
+    worktree's index or to none, never to the parent's.
+
+    Same rule the discovery walk and the watcher fast path already apply
+    (#372, `index_folder._should_index_file`); this is the per-file entry
+    point's copy of it.
+    """
+    try:
+        if not path.is_relative_to(source_root):
+            return None
+        rel = path.relative_to(source_root)
+    except (OSError, ValueError):
+        return None
+    ancestor = source_root
+    for part in rel.parts[:-1]:  # exclude the filename itself
+        ancestor = ancestor / part
+        if is_linked_worktree(ancestor):
+            return ancestor
+    return None
+
+
 def _find_git_root(start: Path) -> Optional[Path]:
     """Walk up from `start` looking for a `.git` directory or file.
 

@@ -5,7 +5,9 @@
 - NEVER edit CHANGELOG.md or version numbers. Origin owns releases.
   Origin's own CLAUDE.md instructs updating them every release; that is
   written from the upstream maintainer's seat and does not apply here.
-- Local divergence: UnrealScript support and junction indexing.
+- Local divergence: UnrealScript support, junction indexing, and the
+  per-file linked-worktree guard (`linked_worktree_between`, called from
+  `index_file`'s containment loop).
 - The top-level cli/ is origin's. Keep it byte-identical to origin/main
   even though its get_symbol import is broken upstream; a local fix would
   turn every future upstream edit there into a merge conflict. The sibling
@@ -24,6 +26,12 @@
   Erlang (multi-clause merge by name/arity), Fortran (module as container),
   SQL (Jinja/dbt strip), Razor (@functions to C#).
 - INDEX_VERSION is 17. Bumping it invalidates cache keys.
+- Containment does not imply the worktree rule. `<repo>/.worktrees/<x>/f.py`
+  is genuinely inside `<repo>`, and `_independent_repo_between` passes it
+  through on purpose (a worktree shares the parent's history). Every path
+  that resolves ownership by containment needs its own worktree test:
+  #372 added one to the walk and the watcher fast path, and the per-file
+  entry point kept admitting worktree files for want of the same check.
 - Junction-mediated files are admitted by LOGICAL path. The one admission
   rule is _junction_logical_rel_path in tools/index_folder.py; containment
   re-checks that resolve the path (validate_path) will reject them.
