@@ -1,20 +1,25 @@
 # jcodemunch-mcp (local fork)
 
 ## This checkout
-- Downstream of jgravelle/jcodemunch-mcp (origin). We pull from it.
-- NEVER edit CHANGELOG.md or version numbers. Origin owns releases.
-  Origin's own CLAUDE.md instructs updating them every release; that is
+- Downstream of jgravelle/jcodemunch-mcp (`upstream`, push DISABLED). Our
+  fork whakomatic/jcodemunch-mcp is `origin`. `main` mirrors upstream/main and
+  carries nothing; `local/main` is upstream/main plus our commits and is what
+  this checkout runs. `git log upstream/main..local/main` lists what is ours.
+- Sync and PRs go through scripts/fork-sync.sh (status, update, pr). Run the
+  committed copy: `MSYS_NO_PATHCONV=1 bash <(git show local/main:scripts/fork-sync.sh) status`.
+- NEVER edit CHANGELOG.md or version numbers. Upstream owns releases.
+  Upstream's own CLAUDE.md instructs updating them every release; that is
   written from the upstream maintainer's seat and does not apply here.
 - Local divergence: UnrealScript support, junction indexing, and the
   per-file linked-worktree guard (`linked_worktree_between`, called from
   `index_file`'s containment loop).
-- The top-level cli/ is origin's. Keep it byte-identical to origin/main
+- The top-level cli/ is upstream's. Keep it byte-identical to upstream/main
   even though its get_symbol import is broken upstream; a local fix would
   turn every future upstream edit there into a merge conflict. The sibling
   jcodemunch-cli project extends this checkout, it does not replace cli/.
-- This file is kept on merge via .gitattributes (CLAUDE.md merge=ours),
-  because origin rewrites its version every release. If a merge ever
-  clobbers it, run: git config merge.ours.driver true
+- CLAUDE.md is upstream's and stays byte-identical to upstream/main. These
+  fork notes live in CLAUDE.local.md, which Claude Code loads after it, so
+  where the two disagree this file wins.
 
 ## Gotchas (not derivable from the code)
 - index_folder is SYNC, dispatched via asyncio.to_thread in server.py.
