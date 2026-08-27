@@ -139,6 +139,48 @@ class TestBashSearchInterception:
             assert "search_text" in hso["additionalContext"], cmd
 
     @pytest.mark.parametrize("cmd", [
+        "grep -rn TODO --include=*.md docs/",
+        "grep -rn TODO --include '*.md' docs/",
+        "rg TODO -g '*.md'",
+        "grep -c priority docs/current/*.md",
+    ])
+    def test_non_code_file_search_passes_silently(self, indexed_tmp, cmd):
+        """The Read branch has always exempted a non-code file: a nudge toward
+        the symbol index is a wrong answer for a file holding no symbols. The
+        Bash branch had no such exemption, so a markdown search was told to use
+        `search_text`, which answers about the code corpus the command was not
+        asking about."""
+        rc, out, _ = _run(run_pretooluse, _pretool(
+            "Bash", {"command": cmd}, cwd=str(indexed_tmp)))
+        assert (rc, out) == (0, ""), cmd
+
+    def test_find_is_not_exempted_by_a_non_code_extension(self, indexed_tmp):
+        """`find` is exempt from the non-code rule, not covered by it. Its nudge
+        is `get_file_tree`, which lists files whether or not the index holds
+        their symbols, so an extension cannot falsify it. Only the
+        `search_text` nudge is falsifiable that way."""
+        rc, out, _ = _run(run_pretooluse, _pretool(
+            "Bash", {"command": "find docs -name '*.md'"}, cwd=str(indexed_tmp)))
+        assert rc == 0
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "get_file_tree" in ctx
+
+    @pytest.mark.parametrize("cmd", [
+        "grep -rn TODO --include=*.py src/",
+        "grep -rn TODO --include=*.py --include=*.md src/",
+        "rg TODO -g '*.ts'",
+    ])
+    def test_code_search_still_nudged_through_a_filter(self, indexed_tmp, cmd):
+        """The other half of the pair. One non-code extension among several does
+        not make a code search unserveable: jcm answers the half that matters,
+        and exempting the whole command would lose the dominant case."""
+        rc, out, _ = _run(run_pretooluse, _pretool(
+            "Bash", {"command": cmd}, cwd=str(indexed_tmp)))
+        assert rc == 0
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "search_text" in ctx, cmd
+
+    @pytest.mark.parametrize("cmd", [
         "FOO=1 grep -rn TODO src/",
         'LC_ALL="C" rg foo',
         "(grep -rn TODO src/)",

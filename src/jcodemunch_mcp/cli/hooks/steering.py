@@ -217,6 +217,53 @@ def _bash_path_is_unresolvable(command: str) -> bool:
     return _SHELL_EXPANSION_RE.search(command) is not None
 
 
+# A file-set restriction written into the command: `--include=*.md`,
+# `--include '*.py'`, `-g '*.ts'` (rg), or a glob operand, which may carry a
+# path prefix (`docs/current/*.md`). The capture is the extension, which is the
+# only part that decides whether jcm can serve the search.
+#
+# ⚠ `-name` is deliberately absent. It belongs to `find`, and `find` is exempt
+# from this rule entirely -- see `_bash_search_is_non_code`.
+_BASH_EXTENSION_FILTER_RE = re.compile(
+    r"""(?:--include[=\s]|--glob[=\s]|-g\s|(?:^|\s))"""
+    r"""["']?[^\s;|&)"']*\*(\.[A-Za-z0-9_]+)["']?(?=$|[\s;|&)])"""
+)
+
+# The commands whose nudge is "use search_text", which is the only nudge an
+# extension filter can falsify. `find`'s nudge is "use get_file_tree", and that
+# stays correct for any extension: the tree lists files, indexed or not.
+_CONTENT_SEARCH_COMMANDS = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "ack"})
+
+
+def _bash_search_is_non_code(command: str, cmd_word: str) -> bool:
+    """True when a content search restricts itself to files jcm does not index.
+
+    The Read branch has always exempted a non-code file, on the plain ground
+    that a nudge toward the symbol index is a wrong answer for a file that
+    holds no symbols. The Bash branch carried no such exemption, so
+    ``grep -rn x --include=*.md docs/`` was told to use ``search_text``, which
+    would search the code index and answer about a corpus the command was not
+    asking about.
+
+    Every extension named must be non-code, not merely one of them: a search
+    over ``*.py`` and ``*.md`` together is a code search with documentation
+    swept in, and jcm serves the half that matters.
+
+    ⚠ Absence of a filter is not evidence of a code search, and this
+    deliberately does NOT try to infer one from a bare directory operand. That
+    question -- does the index hold anything under this path -- is answerable
+    only by the store, and ``list_source_roots`` documents the per-repo scan it
+    exists to avoid. Erring toward the nudge is the safe direction: a wrong
+    nudge is a sentence of text.
+    """
+    if cmd_word not in _CONTENT_SEARCH_COMMANDS:
+        return False
+    extensions = _BASH_EXTENSION_FILTER_RE.findall(command)
+    if not extensions:
+        return False
+    return all(ext.lower() not in _CODE_EXTENSIONS for ext in extensions)
+
+
 def _bash_targets_outside_roots(command: str, roots: "list[str]") -> bool:
     """True when the command names an absolute/home path outside every indexed
     root — a search jcm cannot serve, so a strict deny would block real work
@@ -278,6 +325,8 @@ def _handle_bash(tool_input: dict, cwd: str, mode: str) -> int:
         return 0  # Outside every indexed repo — allow silently.
     if _bash_targets_outside_roots(command, roots):
         return 0  # Search names a path jcm cannot serve — stay silent.
+    if _bash_search_is_non_code(command, cmd_word):
+        return 0  # Restricted to files jcm does not index — stay silent.
     return _emit_search_steering("Bash", f"this `{cmd_word}` command", deny=deny)
 
 
