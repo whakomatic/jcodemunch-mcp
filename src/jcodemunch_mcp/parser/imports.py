@@ -265,23 +265,61 @@ def _extract_js_imports(content: str) -> list[dict]:
     return edges
 
 
+_PY_NAME_LIST_LINE = re.compile(r"^[\s\w,.*()\\]*$")
+
+
+def _python_import_clause(content: str, first_line: str, end: int) -> str:
+    """The whole name list of a `from x import ...` statement, as one line.
+
+    `_PY_FROM` matches a single line, so a parenthesised or backslash-continued
+    import handed over only the names beside `import`. `end` is the offset of
+    the newline that closes `first_line`; the lines after it are read until the
+    parenthesis closes or the backslashes stop. A line that is not a name list
+    ends the read, so prose that happens to match `_PY_FROM` and an import
+    whose parenthesis never closes take in nothing past their own names.
+    """
+    clause = first_line.split("#", 1)[0]
+    in_parens = "(" in clause and ")" not in clause
+    while in_parens or clause.rstrip().endswith("\\"):
+        if end >= len(content):
+            break
+        stop = content.find("\n", end + 1)
+        if stop == -1:
+            stop = len(content)
+        line = content[end + 1:stop].split("#", 1)[0]
+        if not _PY_NAME_LIST_LINE.match(line):
+            break
+        clause = clause.rstrip().rstrip("\\") + " " + line
+        end = stop
+        if in_parens and ")" in line:
+            break
+    return clause.replace("(", " ").replace(")", " ").replace("\\", " ")
+
+
 def _extract_python_imports(content: str) -> list[dict]:
     edges = []
     seen: set[str] = set()
+    by_specifier: dict[str, dict] = {}
+
+    def add(specifier: str, names: list[str]) -> None:
+        # A second statement for a specifier the file already imported adds its
+        # names to the one edge; it used to be dropped whole.
+        edge = by_specifier.get(specifier)
+        if edge is None:
+            seen.add(specifier)
+            edge = by_specifier[specifier] = {"specifier": specifier, "names": []}
+            edges.append(edge)
+        edge["names"].extend(n for n in names if n not in edge["names"])
 
     for m in _PY_FROM.finditer(content):
-        module, names_str = m.group(1), m.group(2)
+        module = m.group(1)
         # Skip 'from __future__ import ...'
         if module.strip() == "__future__":
             continue
         specifier = module.strip()
-        names = _clean_names(names_str)
-        # Handle 'from foo import (A, B)' — strip parens
-        names = [n.strip("()") for n in names]
+        names = _clean_names(_python_import_clause(content, m.group(2), m.end()))
         names = [n for n in names if n and n != "*"]
-        if specifier not in seen:
-            seen.add(specifier)
-            edges.append({"specifier": specifier, "names": names})
+        add(specifier, names)
 
         # ⚠⚠ `from . import receipts` is a dependency on the SIBLING MODULE
         # `receipts`, not on the package's `__init__.py` (#550, @rknighton).
@@ -335,10 +373,7 @@ def _extract_python_imports(content: str) -> list[dict]:
         if names:
             _prefix = specifier if set(specifier) == {"."} else f"{specifier}."
             for _name in names:
-                _sub = f"{_prefix}{_name}"
-                if _sub not in seen:
-                    seen.add(_sub)
-                    edges.append({"specifier": _sub, "names": [_name]})
+                add(f"{_prefix}{_name}", [_name])
 
     for m in _PY_IMPORT.finditer(content):
         for mod in m.group(1).split(","):
