@@ -172,6 +172,7 @@ def _check_single(
         defining_spans.setdefault(file_path, []).append((lo, max(lo, hi)))
 
     content_references = []
+    word = re.compile(r"(?<!\w)" + re.escape(ident_lower) + r"(?!\w)")
 
     if search_content:
         content_dir = store._content_dir(owner, name)
@@ -192,7 +193,7 @@ def _check_single(
 
             file_matches = []
             for line_index, line in enumerate(content.split("\n")):
-                if ident_lower not in _fold(line):
+                if not word.search(_fold(line)):
                     continue
                 line_no = line_index + 1
                 if any(lo <= line_no <= hi for lo, hi in spans):
