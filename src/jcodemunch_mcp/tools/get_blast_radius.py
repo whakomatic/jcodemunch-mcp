@@ -17,7 +17,7 @@ from ..retrieval.verdict import (
 from ._dynamic_boundary import FILES_CAP as DYNAMIC_FILES_CAP, DynamicBoundary
 from ._utils import index_status_to_tool_error, resolve_repo, resolve_fqn
 from .package_registry import extract_root_package_from_specifier
-from ._call_graph import build_symbols_by_file, bfs_callers
+from ._call_graph import build_symbols_by_file, bfs_callers, reexport_hop_importers
 from .find_dead_code import _is_test_file
 from .decision_context import resolve_decision_context
 from ._scip_consume import open_scip_reader, scip_meta_and_stale, scip_meta_block
@@ -566,6 +566,17 @@ def get_blast_radius(
             confirmed.append({"file": imp_file, "references": count})
         else:
             potential.append({"file": imp_file, "reason": "symbol name not found (may use namespace/wildcard import)"})
+
+    # A Python module that re-exports the name puts its importers' `mod.name()`
+    # calls one hop out; they are real references even at depth 1.
+    for hop_file in reexport_hop_importers(index, sym, rev):
+        if hop_file in importer_files:
+            continue
+        content = store.get_file_content(owner, name, hop_file)
+        if content is not None and _name_in_content(content, sym_name):
+            content_cache[hop_file] = content
+            count = len(re.findall(r"\b" + re.escape(sym_name) + r"\b", content))
+            confirmed.append({"file": hop_file, "references": count})
 
     confirmed.sort(key=lambda x: x["file"])
     potential.sort(key=lambda x: x["file"])

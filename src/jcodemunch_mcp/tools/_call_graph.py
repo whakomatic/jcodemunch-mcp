@@ -30,6 +30,8 @@ import re
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 
+from ..parser.imports import resolve_specifier
+
 if TYPE_CHECKING:
     from ..storage import IndexStore
     from ..storage.index_store import CodeIndex
@@ -162,6 +164,41 @@ class _CalleeNameIndex:
 # Direct caller / callee finders
 # ---------------------------------------------------------------------------
 
+def reexport_hop_importers(
+    index: "CodeIndex",
+    sym: dict,
+    reverse_adj: dict[str, list[str]],
+) -> list[str]:
+    """Files that reach *sym* through a Python module that re-exports its name.
+
+    `from validate import check_summary` in vulcan.py makes `v.check_summary()`
+    in a file that only does `import vulcan as v` a call to the symbol, yet that
+    file is not an importer of validate.py. One hop: importers of an importer
+    whose own import of sym's file names the symbol.
+    """
+    sym_name: str = sym.get("name", "")
+    sym_file: str = sym.get("file", "")
+    imports = getattr(index, "imports", None)
+    if not imports or not sym_name or not sym_file.endswith((".py", ".pyi")):
+        return []
+    source_files = frozenset(index.source_files)
+    alias_map = getattr(index, "alias_map", None)
+    psr4_map = getattr(index, "psr4_map", None)
+    direct = set(reverse_adj.get(sym_file, []))
+    hop: list[str] = []
+    for reexporter in direct:
+        if not any(
+            sym_name in imp.get("names", ())
+            and resolve_specifier(imp["specifier"], reexporter, source_files, alias_map, psr4_map) == sym_file
+            for imp in imports.get(reexporter, [])
+        ):
+            continue
+        for f in reverse_adj.get(reexporter, []):
+            if f != sym_file and f not in direct and f not in hop:
+                hop.append(f)
+    return hop
+
+
 def _callers_from_references(
     index: "CodeIndex",
     sym: dict,
@@ -186,6 +223,7 @@ def _callers_from_references(
 
     # Files that import sym's file + sym's own file (for same-file callers)
     importing_files = set(reverse_adj.get(sym_file, []))
+    importing_files.update(reexport_hop_importers(index, sym, reverse_adj))
     search_files = importing_files | {sym_file}
 
     # Look up by (file, sym_name) for each candidate file
@@ -535,7 +573,7 @@ def find_direct_callers(
     callers: list[dict] = []
     seen_ids: set[str] = set(ast_caller_ids) | lsp_ids
 
-    for imp_file in reverse_adj.get(sym_file, []):
+    for imp_file in reverse_adj.get(sym_file, []) + reexport_hop_importers(index, sym, reverse_adj):
         if content_cache is not None:
             file_content = content_cache.content(imp_file)
         else:
